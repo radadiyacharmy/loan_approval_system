@@ -16,7 +16,61 @@ import datetime as dt
 import pickle
 
 import os
-from sklearn.metrics import auc, f1_score, precision_score, recall_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import auc, f1_score, precision_score, recall_score, confusion_matrix, ConfusionMatrixDisplay, roc_curve
+
+#%%
+
+
+def generate_decile_chart(model, X, y, n_deciles=10, bad_label=1):
+
+    # Predicted probability of Bad (class 1)
+    class_index = list(model.classes_).index(bad_label)
+
+    probabilities = model.predict_proba(X)[:, class_index]
+
+    decile_df = pd.DataFrame({
+        "prob": probabilities,
+        "actual": np.asarray(y)
+    })
+
+    # Rank from highest risk to lowest risk
+    decile_df["rank"] = decile_df["prob"].rank(
+        method="first",
+        ascending=False
+    )
+
+    # Assign deciles: 1 = highest risk
+    decile_df["decile"] = np.ceil(
+        decile_df["rank"] * n_deciles / len(decile_df)
+    ).astype(int)
+
+    # Guard against edge cases
+    decile_df["decile"] = decile_df["decile"].clip(
+        upper=n_deciles
+    )
+
+    # Aggregate decile statistics
+    decile_chart = (
+        decile_df
+        .groupby("decile")
+        .agg(
+            min_prob=("prob", "min"),
+            max_prob=("prob", "max"),
+            total_count=("prob", "size"),
+            bad_count=("actual", lambda x: (x == bad_label).sum()),
+        )
+        .reset_index()
+        .sort_values("decile")
+    )
+
+    decile_chart["bad_rate"] = (decile_chart["bad_count"] / decile_chart["total_count"]) * 100
+
+    total_bad_rate = (decile_chart["bad_count"].sum() / decile_chart["total_count"].sum()) * 100
+
+    decile_chart["lift"] = decile_chart["bad_rate"] / total_bad_rate
+
+    return decile_chart, decile_df
+
 
 #%%
 
@@ -47,6 +101,8 @@ not_eligible = final_df[(final_df['ever_60_dpd_24_mob'] != 1) & (final_df['max_m
 final_df = final_df[~final_df['app_id'].isin(not_eligible)]
 
 final_df.head()
+
+# final_df.drop(cols_to_drop, axis=1, inplace=True)
 
 #%%
 
@@ -113,7 +169,7 @@ study = optuna.create_study(
 )
 
 # Run optimization
-study.optimize(objective, n_trials=2)
+study.optimize(objective, n_trials=20)
 
 print("Best F1-score:", study.best_value)
 print("Best Parameters:", study.best_params)
@@ -153,13 +209,32 @@ shap_ranking.insert(0, 'rank', shap_ranking.index + 1)
 
 #%%
 
-k = 10
+k = 15
 top_k_feaatures = shap_ranking[shap_ranking['rank'] <= k]['feature'].to_list()
+
 
 #%%
 
-X_train_final = X_train[top_k_feaatures]
-X_test_final = X_test[top_k_feaatures]
+final_features = [
+ 'foir',
+ 'avg_dpd_active',
+ 'ltv',
+ 'disposable_income',
+ 'monthly_income',
+ 'overdue_to_income_ratio',
+ 'no_enq_12_months',
+ 'loan_amount',
+ 'emi',
+ 'total_unsecured_overdue',
+ 'no_enq_12_months_HL'
+]
+
+
+X_train_final = X_train[final_features]
+X_test_final = X_test[final_features] 
+
+# X_train_final = X_train[top_k_feaatures]
+# X_test_final = X_test[top_k_feaatures]
 
 
 def objective(trial):
@@ -206,7 +281,7 @@ study = optuna.create_study(
 )
 
 # Run optimization
-study.optimize(objective, n_trials=2)
+study.optimize(objective, n_trials=30)
 
 print("Best F1-score:", study.best_value)
 print("Best Parameters:", study.best_params)
@@ -225,14 +300,51 @@ f1_scr = f1_score(y_test, y_pred_final)
 
 print(f'final f1_score : {f1_scr}')
 
-auc = roc_auc_score(y_true=y_test, y_score=y_prob_final[:, 1])
+auc_val = roc_auc_score(y_true=y_test, y_score=y_prob_final[:, 1])
 
-print(f'final auc: {auc}')
+print(f'final auc: {auc_val}')
+
+#%%
+
+fpr, tpr, _ = roc_curve(y_test, y_prob_final[:, 1])
+roc_auc = auc(fpr, tpr)
+
+# 3. Plot ROC Curve
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'LightGBM ROC curve (AUC = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Guess (AUC = 0.50)')
+
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
+plt.ylabel('True Positive Rate (Sensitivity)', fontsize=12)
+plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14)
+plt.legend(loc="lower right", fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#%%
+
+
+explainer = shap.TreeExplainer(base_xgb_final)
+shap_values = explainer(X_test_final)
+
+# 5. Generate and Display the SHAP Beeswarm Plot
+plt.figure(figsize=(10, 8))
+shap.plots.beeswarm(shap_values, max_display=20)
+
 
 
 #%%
 
 # run_server(storage)
+
+#%%
+
+decile_chart, decile_df = generate_decile_chart(base_xgb_final, X_test_final, y_test, n_deciles=10, bad_label=1)
+
+decile_chart
 
 #%%
 
@@ -245,3 +357,4 @@ with open(os.path.join(model_folder_path, 'model.pkl'), 'wb') as file:
     pickle.dump(base_xgb_final, file)
 
 #%%
+

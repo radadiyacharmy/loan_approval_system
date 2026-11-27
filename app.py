@@ -1,402 +1,592 @@
-import streamlit as st 
-import requests
-from streamlit_lottie import st_lottie
+#%%
+
+import os
+import streamlit as st
 import shap
 import numpy as np
 import pandas as pd
-# from src.pipelines.prediction_pipeline import Prediction
-# from src.components.model_trainning import ModelTrainning
-# from src.utils import load_obj
+import traceback
+
+#%%
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+BASE_PATH = os.getcwd()
+
+MODEL_PATH = os.path.join(
+    BASE_PATH,
+    "results",
+    "model",
+    "model_28_11_2026_01_18_52",
+    "model.pkl"
+)
+
+DATA_PATH = os.path.join(
+    BASE_PATH,
+    "base_data",
+    "home_loan_applications_features_20k_extended.csv"
+)
+
+# Scorecard scaling
+BASE_SCORE = 850
+BASE_ODDS = 50
+PDO = 50
+
+FACTOR = PDO / np.log(2)
+
+# Class 1 represents cancellation
+EVENT_CLASS = 1
 
 
-# 'state', 'area_code', 'international_plan', 'voice_mail_plan',
-#        'number_vmail_messages', 'total_day_minutes', 'total_day_calls',
-#        'total_day_charge', 'total_eve_charge', 'total_night_charge',
-#        'total_intl_minutes', 'total_intl_calls', 'total_intl_charge',
-#        'number_customer_service_calls'
+# =========================================================
+# LOAD MODEL AND DATA
+# =========================================================
 
-# state                                       NH
-# area_code                        area_code_415
-# international_plan                          no
-# voice_mail_plan                             no
-# number_vmail_messages                        0
-# total_day_minutes                        254.3
-# total_day_calls                            113
-# total_day_charge                         43.23
-# total_eve_charge                          6.71
-# total_night_charge                        6.89
-# total_intl_minutes                        11.8
-# total_intl_calls                             2
-# total_intl_charge                         3.19
-# number_customer_service_calls                2
+@st.cache_resource
+def load_model():
+
+    return pd.read_pickle(MODEL_PATH)
 
 
-def load_lottie_url(url):
+@st.cache_data
+def load_data():
 
-    r = requests.get(url)
-    
-    if r.status_code != 200:
-        return None
-    else:
-        return r.json()
+    return pd.read_csv(DATA_PATH)
+
+
+# =========================================================
+# SHAP SCORECARD CALCULATION
+# =========================================================
+
+def calculate_scorecard(model, input_df):
+
+    # Initialize SHAP explainer
+    explainer = shap.TreeExplainer(
+        model,
+        model_output="raw"
+    )
+
+    # Calculate SHAP values
+    shap_exp = explainer(input_df)
+
+    feature_shap = np.asarray(shap_exp.values)[0]
+
+    base_value = float(
+        np.asarray(shap_exp.base_values).reshape(-1)[0]
+    )
+
+    # -----------------------------------------------------
+    # 1. MODEL PROBABILITY
+    # -----------------------------------------------------
+
+    probabilities = model.predict_proba(input_df)[0]
+
+    class_index = list(model.classes_).index(EVENT_CLASS)
+
+    event_probability = float(probabilities[class_index])
+
+    # Avoid division by zero
+    event_probability = np.clip(
+        event_probability,
+        1e-15,
+        1 - 1e-15
+    )
+
+    # Good : Bad odds
+    model_odds = (
+        (1 - event_probability) / event_probability
+    )
+
+    # -----------------------------------------------------
+    # 2. BASELINE ODDS
+    # -----------------------------------------------------
+
+    base_odds = np.exp(-base_value)
+
+    # -----------------------------------------------------
+    # 3. INDIVIDUAL ADDITIVE ODDS CONTRIBUTIONS
+    # -----------------------------------------------------
+
+    previous_margin = base_value
+
+    odds_contributions = []
+
+    for shap_value in feature_shap:
+
+        current_margin = previous_margin + shap_value
+
+        # Good : Bad odds
+        previous_odds = np.exp(-previous_margin)
+
+        current_odds = np.exp(-current_margin)
+
+        contribution = current_odds - previous_odds
+
+        odds_contributions.append(contribution)
+
+        previous_margin = current_margin
+
+    odds_contributions = np.array(odds_contributions)
+
+    # -----------------------------------------------------
+    # 4. BASELINE SCORE
+    # -----------------------------------------------------
+
+    base_score = (
+        BASE_SCORE
+        - FACTOR * (np.log(BASE_ODDS) + base_value)
+    )
+
+    # -----------------------------------------------------
+    # 5. INDIVIDUAL SCORE CONTRIBUTIONS
+    # -----------------------------------------------------
+
+    feature_scores = -feature_shap * FACTOR
+
+    # -----------------------------------------------------
+    # 6. FINAL SCORE
+    # -----------------------------------------------------
+
+    final_score = base_score + feature_scores.sum()
+
+    # -----------------------------------------------------
+    # 7. FINAL ODDS
+    # -----------------------------------------------------
+
+    calculated_odds = (
+        base_odds + odds_contributions.sum()
+    )
+
+    # Final log-odds from SHAP
+    total_margin = base_value + feature_shap.sum()
+
+    # -----------------------------------------------------
+    # 8. VALIDATION
+    # -----------------------------------------------------
+
+    # SHAP margin must reconcile with model probability
+    shap_probability = 1 / (1 + np.exp(-total_margin))
+
+    np.testing.assert_allclose(
+        shap_probability,
+        event_probability,
+        rtol=1e-5,
+        atol=1e-7,
+        err_msg="SHAP probability does not match model probability"
+    )
+
+    # Additive odds must reconcile with model odds
+    np.testing.assert_allclose(
+        calculated_odds,
+        model_odds,
+        rtol=1e-5,
+        atol=1e-7,
+        err_msg="SHAP odds do not match model odds"
+    )
+
+    # -----------------------------------------------------
+    # 9. FEATURE EXPLANATION DATAFRAME
+    # -----------------------------------------------------
+
+    explanation = pd.DataFrame({
+
+        "Feature Name": input_df.columns,
+
+        "SHAP Value": feature_shap,
+
+        "Odds Contribution": odds_contributions,
+
+        "Score Contribution": feature_scores
+
+    })
+
+    explanation = explanation.sort_values(
+        by="Score Contribution"
+    )
+
+    # -----------------------------------------------------
+    # 10. BASELINE AND TOTAL ROWS
+    # -----------------------------------------------------
+
+    baseline_row = pd.DataFrame([{
+
+        "Feature Name": "Base Line",
+
+        "SHAP Value": base_value,
+
+        "Odds Contribution": base_odds,
+
+        "Score Contribution": base_score
+
+    }])
+
+    total_row = pd.DataFrame([{
+
+        "Feature Name": "Total",
+
+        "SHAP Value": total_margin,
+
+        "Odds Contribution": calculated_odds,
+
+        "Score Contribution": final_score
+
+    }])
+
+    result_df = pd.concat(
+        [
+            baseline_row,
+            explanation,
+            total_row
+        ],
+        ignore_index=True
+    )
+
+    return {
+
+        "probability": event_probability,
+
+        "model_odds": model_odds,
+
+        "base_value": base_value,
+
+        "base_odds": base_odds,
+
+        "base_score": base_score,
+
+        "final_score": final_score,
+
+        "final_odds": calculated_odds,
+
+        "explanation": result_df
+
+    }
+
+
+# =========================================================
+# DISPLAY RESULTS
+# =========================================================
+
+def display_results(result):
+
+    final_score = result["final_score"]
+
+    decision = "Approved" if final_score >= 500 else "Reject"
+
+    decision_color = "#008000" if decision == "Approved" else "#C2183A"
+
+    st.markdown(
+        f"""
+        <div style="
+            background-color: {decision_color};
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            color: white;
+            margin-top: 10px;
+        ">
+            <h3 style="margin:0; color:white;">{decision}</h3>
+            <p style="margin:5px 0 0 0;">Score: {final_score:.2f}</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.subheader("Model Prediction")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Bad/NPA Probability",
+        f"{result['probability']:.2%}"
+    )
+
+    col2.metric(
+        "Good : Bad Odds",
+        f"{result['final_odds']:.4f}"
+    )
+
+    col3.metric(
+        "Final Score",
+        f"{result['final_score']:.2f}"
+    )
+
+    st.divider()
+
+    st.subheader("SHAP Scorecard")
+
+    st.dataframe(
+
+        result["explanation"].style.format({
+
+            "SHAP Value": "{:+.6f}",
+
+            "Odds Contribution": "{:+.6f}",
+
+            "Score Contribution": "{:+.2f}"
+
+        }),
+
+        use_container_width=True,
+
+        hide_index=True
+
+    )
+
+    # Reconciliation
+    st.divider()
+
+    st.subheader("Reconciliation")
+
+    odds_check = result["explanation"][
+        "Odds Contribution"
+    ].sum()
+
+    score_check = result["explanation"][
+        "Score Contribution"
+    ].sum()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.write("**Odds reconciliation**")
+
+        st.write(
+            f"Sum of contributions: {odds_check:.8f}"
+        )
+
+        st.write(
+            f"Model odds: {result['model_odds']:.8f}"
+        )
+
+    with col2:
+
+        st.write("**Score reconciliation**")
+
+        st.write(
+            f"Sum of contributions: {score_check:.4f}"
+        )
+
+        st.write(
+            f"Final score: {result['final_score']:.4f}"
+        )
+
+
+# =========================================================
+# MAIN STREAMLIT APPLICATION
+# =========================================================
 
 def main():
 
-    st.set_page_config(page_title='loan_application', layout='wide')
+    st.set_page_config(
+        page_title="SYM Scorecard",
+        layout="wide"
+    )
 
-    # lottie_file = load_lottie_url('https://lottie.host/598e9e70-6768-410d-b309-b8e8c6be56a2/N9wcpBAsqi.json')
-    lottie_file = load_lottie_url('https://lottie.host/59ca70ea-e33d-453f-968e-26d42466abee/q2wjnXKxyV.json')
+    st.title("Loan Application Scorecard")
 
-    menu = ['About', 'App']
-    choice = st.sidebar.selectbox('Menu', menu)
+    menu = [
+        "About",
+        "App"
+    ]
 
-    if choice == 'About':
+    choice = st.sidebar.selectbox(
+        "Menu",
+        menu
+    )
 
-        with st.container():
+    if choice == "About":
 
-            st.write('To run the application, select app from Menu dropdown from navigation bar present on left side')
+        st.header("About the Application")
 
-        with st.container():
-            st.write('---')
-            left_col, right_col = st.columns(2)
+        st.write(
+            """
+            This application predicts loan application
+            cancellation probability using an XGBoost model.
 
-            with left_col:
-                
-                st.header('Problem Statment')
-                st.write('##')
-                st.write(
-                    """
-                            The problem at hand revolves around predicting customer churn, a crucial task in various industries, particularly in subscription-based services such as telecommunications, banking, and SaaS companies. Customer churn refers to the phenomenon where customers discontinue their services or subscriptions with a company. Identifying potential churners beforehand allows businesses to take proactive measures such as targeted marketing campaigns or personalized retention strategies to mitigate churn and retain valuable customers.
-                    """
-                )
-            
-            with right_col:
-                st_lottie(lottie_file, height=300, key='customer_retention')
+            SHAP is used to explain individual predictions.
 
-        with st.container():
+            The application also converts SHAP contributions
+            into additive odds contributions and score
+            contributions.
+            """
+        )
 
-            git_hub_url = 'https://github.com/soil15/Customer_churn'
-            # model_tran = ModelTrainning()
-            # class_repo = load_obj(model_tran.model_trainning_cofg_obj.class_repo_path)
+    # -----------------------------------------------------
+    # APP MENU
+    # -----------------------------------------------------
 
-            st.write('---')
-            st.header('Key Steps in Solving the Problem:')
-            st.markdown("[Github Repository](%s)" % git_hub_url)
-            st.write('##')
+    elif choice == "App":
 
-            # ---------------------------------------
-            st.subheader('1. Data Ingestion')
-            st.write('I began by ingesting the raw data using a robust data ingestion pipeline, ensuring that data from various sources is seamlessly integrated for further processing.')
+        choice_2 = st.sidebar.selectbox(
 
-            # ---------------------------------------
-            st.subheader('2. Data Transformation')
-            st.write('Next, I focused on transforming the raw data into a format suitable for model training. This involved preprocessing steps such as handling missing values, encoding categorical variables, and splitting the data into training and testing sets.')
+            "Menu",
 
-            # ---------------------------------------
-            st.subheader('3. Model Training')
-            st.write('Leveraging the XGBoost classifier and the optimized hyperparameters obtained through tuning, I trained a predictive model on the preprocessed data. This model is finely tuned to prioritize recall, ensuring that it effectively identifies potential churners, which is crucial for implementing targeted retention strategies.')
+            [
+                "New Application",
+                "By Login IDs"
+            ]
 
-            # ---------------------------------------
-            st.subheader('4. Hyperparameter Tuning for Recall Optimization')
-            st.write('To further enhance model performance, I employed advanced techniques such as hyperparameter tuning with a primary focus on maximizing the recall score. By defining a custom scoring function that prioritizes precision, and conducting grid search cross-validation over a range of hyperparameters, I fine-tuned the XGBoost classifier to effectively identify potential churners while maintaining reasonable precision.')
-            
-            # ---------------------------------------
-            st.subheader('5. Evaluation and Model Deployment')
-            st.write(' After training the model, I thoroughly evaluated its performance using metrics such as confusion matrix, classification report.')
-            # st.write(class_repo)
+        )
 
+        model = load_model()
 
-    elif choice == 'App':
+        df = load_data()
 
-        menu_2 = ['by_app_id', 'by_input']
-        choice_2 = st.sidebar.selectbox('Menu', menu_2)
+        feature_names = model.get_booster().feature_names
 
+        if not feature_names:
 
-        if choice_2 == 'by_input':
+            st.error("Model feature names are unavailable.")
 
+            return
 
-            with st.form(key='input_form'):
+        # ================================================
+        # NEW APPLICATION
+        # ================================================
 
-                appid = st.number_input('Enter application ID', min_value=10437)
+        if choice_2 == "New Application":
 
-                submit_button = st.form_submit_button()
+            st.header("New Loan Application")
 
-                model = pd.read_pickle(r'C:\Users\sahil\OneDrive\Desktop\SYM_SCORECARD\results\model\model_27_11_2026_02_04_44\model.pkl')
+            # Default values from first available row
+            # default_row = df.iloc[0]
+            default_row = df[df['app_id'] == 18073].iloc[0]
 
-                df = pd.read_csv(r'C:\Users\sahil\OneDrive\Desktop\SYM_SCORECARD\base_data\home_loan_applications_features_20k_extended.csv')
-
-                df = df.head(1)
+            with st.form(key="new_application_form"):
 
                 selected_features = {}
 
-                for feature in model.get_booster().feature_names:
+                st.write("Enter application details")
+
+                for feature in feature_names:
+
+                    default_value = default_row[feature]
+
+                    if pd.isna(default_value):
+                        default_value = 0.0
+
                     selected_features[feature] = st.number_input(
+
                         label=feature,
-                        value=float(df[feature].values[0]),
-                        key=feature
-                    )   
 
-                input_df = pd.DataFrame(
+                        value=float(default_value),
+
+                        key=f"new_{feature}"
+
+                    )
+
+                submit_button = st.form_submit_button(
+                    "Calculate Score",
+                    use_container_width=True
+                )
+
+            if submit_button:
+
+                try:
+
+                    input_df = pd.DataFrame(
+
                         [selected_features],
-                        columns=model.get_booster().feature_names
+
+                        columns=feature_names
+
                     )
 
-                if submit_button:
-                        
-                    df = df[df['app_id'] == appid]
-
-                    model = pd.read_pickle(r'C:\Users\sahil\OneDrive\Desktop\SYM_SCORECARD\results\model\model_27_11_2026_01_05_07\model.pkl')
-                    
-                    input_df = df[model.get_booster().feature_names]
-
-                    # Scorecard scaling parameters
-                    BASE_SCORE = 600
-                    BASE_ODDS = 50
-                    PDO = 20
-
-                    FACTOR = PDO / np.log(2)
-
-
-                    # Initialize once when your API starts, not for every request
-                    explainer = shap.TreeExplainer(
+                    result = calculate_scorecard(
                         model,
-                        model_output="raw"
+                        input_df
                     )
 
-                    # Calculate SHAP values for the incoming applicant
-                    shap_values = explainer(input_df)
+                    display_results(result)
 
-                    # Extract feature contributions
-                    feature_shap = shap_values.values[0]
+                except Exception as e:
 
-                    # Extract SHAP base value
-                    base_value = float(
-                        np.asarray(shap_values.base_values).reshape(-1)[0]
-                    )
+                    st.error(f"Calculation failed: {e}")
 
-                    # Convert base value into base score
-                    base_score = (
-                        BASE_SCORE
-                        - FACTOR * (np.log(BASE_ODDS) + base_value)
-                    )
+                    st.code(traceback.format_exc())
 
-                    # Convert individual SHAP values into score points
-                    feature_scores = -feature_shap * FACTOR
+        # ================================================
+        # BY LOGIN IDS
+        # ================================================
 
-                    # Final score
-                    final_score = base_score + feature_scores.sum()
+        elif choice_2 == "By Login IDs":
 
-                    # Feature-wise explanation
-                    explanation = pd.DataFrame({
-                        "feature": input_df.columns,
-                        "shap_value": feature_shap,
-                        "score_contribution": feature_scores
-                    })
+            st.header("Search by Application ID")
 
-                    explanation = explanation.sort_values(
-                        by="score_contribution"
-                    )
+            if "app_id" not in df.columns:
 
-                    result = {
-                        "base_value": base_value,
-                        "base_score": round(float(base_score), 2),
-                        "feature_contributions": explanation,
-                        "final_score": round(float(final_score), 2)
-                    }
-                    
-                    # Extract results
-                    base_value = result["base_value"]
-                    base_score = result["base_score"]
-                    feature_df = result["feature_contributions"]
-                    final_score = result["final_score"]
+                st.error("app_id column not found in dataset.")
 
-                    # Baseline odds (Good:Bad)
-                    base_odds = np.exp(-base_value)
+                return
 
-                    # Prepare display dataframe
-                    display_df = pd.DataFrame({
-                        "Feature Name": feature_df["feature"],
-                        "Odds": np.exp(feature_df["shap_value"]),
-                        "Score": feature_df["score_contribution"]
-                    })
+            with st.form(key="login_id_form"):
 
-                    # Baseline row
-                    baseline_row = pd.DataFrame({
-                        "Feature Name": ["Base Line"],
-                        "Odds": [base_odds],
-                        "Score": [base_score]
-                    })
+                appid = st.number_input(
 
-                    # Total odds
-                    total_odds = base_odds * np.exp(
-                        -feature_df["shap_value"].sum()
-                    )
+                    "Enter Application ID",
 
-                    # Total row
-                    total_row = pd.DataFrame({
-                        "Feature Name": ["Total"],
-                        "Odds": [total_odds],
-                        "Score": [final_score]
-                    })
+                    min_value=10437,
 
-                    # Combine rows
-                    display_df = pd.concat(
-                        [baseline_row, display_df, total_row],
-                        ignore_index=True
-                    )
+                    step=1
 
-                    # Display
-                    st.dataframe(
-                        display_df.style.format({
-                            "Odds": "{:.2f}",
-                            "Score": "{:+.2f}"
-                        }),     
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
+                )
 
-        elif choice_2 == 'by_app_id':
+                submit_button = st.form_submit_button(
 
-            with st.form(key='input_form'):
+                    "Calculate Score",
 
-                appid = st.number_input('Enter application ID', min_value=10437)
+                    use_container_width=True
 
-                submit_button = st.form_submit_button()
-                
-                if submit_button:
+                )
 
-                        
-                    df = pd.read_csv(r'C:\Users\sahil\OneDrive\Desktop\SYM_SCORECARD\base_data\home_loan_applications_features_20k_extended.csv')
+            if submit_button:
 
-                    df = df[df['app_id'] == appid]
+                try:
 
-                    model = pd.read_pickle(r'C:\Users\sahil\OneDrive\Desktop\SYM_SCORECARD\results\model\model_27_11_2026_01_05_07\model.pkl')
-                    
-                    input_df = df[model.get_booster().feature_names]
+                    application_df = df.loc[
+                        df["app_id"] == appid
+                    ]
 
-                    # Scorecard scaling parameters
-                    BASE_SCORE = 600
-                    BASE_ODDS = 50
-                    PDO = 20
+                    if application_df.empty:
 
-                    FACTOR = PDO / np.log(2)
+                        st.warning(
+                            f"No application found for ID: {appid}"
+                        )
 
+                        return
 
-                    # Initialize once when your API starts, not for every request
-                    explainer = shap.TreeExplainer(
+                    if len(application_df) > 1:
+
+                        st.warning(
+                            "Multiple records found. Using the first record."
+                        )
+
+                    input_df = application_df[
+                        feature_names
+                    ].iloc[[0]].copy()
+
+                    result = calculate_scorecard(
                         model,
-                        model_output="raw"
+                        input_df
                     )
 
-                    # Calculate SHAP values for the incoming applicant
-                    shap_values = explainer(input_df)
+                    st.write(f"Application ID: {appid}")
 
-                    # Extract feature contributions
-                    feature_shap = shap_values.values[0]
+                    display_results(result)
 
-                    # Extract SHAP base value
-                    base_value = float(
-                        np.asarray(shap_values.base_values).reshape(-1)[0]
-                    )
+                except Exception as e:
 
-                    # Convert base value into base score
-                    base_score = (
-                        BASE_SCORE
-                        - FACTOR * (np.log(BASE_ODDS) + base_value)
-                    )
+                    st.error(f"Calculation failed: {e}")
 
-                    # Convert individual SHAP values into score points
-                    feature_scores = -feature_shap * FACTOR
-
-                    # Final score
-                    final_score = base_score + feature_scores.sum()
-
-                    # Feature-wise explanation
-                    explanation = pd.DataFrame({
-                        "feature": input_df.columns,
-                        "shap_value": feature_shap,
-                        "score_contribution": feature_scores
-                    })
-
-                    explanation = explanation.sort_values(
-                        by="score_contribution"
-                    )
-
-                    result = {
-                        "base_value": base_value,
-                        "base_score": round(float(base_score), 2),
-                        "feature_contributions": explanation,
-                        "final_score": round(float(final_score), 2)
-                    }
-                    
-                    # Extract results
-                    base_value = result["base_value"]
-                    base_score = result["base_score"]
-                    feature_df = result["feature_contributions"]
-                    final_score = result["final_score"]
-
-                    # Baseline odds (Good:Bad)
-                    base_odds = np.exp(-base_value)
-
-                    # Prepare display dataframe
-                    display_df = pd.DataFrame({
-                        "Feature Name": feature_df["feature"],
-                        "Odds": np.exp(feature_df["shap_value"]),
-                        "Score": feature_df["score_contribution"]
-                    })
-
-                    # Baseline row
-                    baseline_row = pd.DataFrame({
-                        "Feature Name": ["Base Line"],
-                        "Odds": [base_odds],
-                        "Score": [base_score]
-                    })
-
-                    # Total odds
-                    total_odds = base_odds * np.exp(
-                        -feature_df["shap_value"].sum()
-                    )
-
-                    # Total row
-                    total_row = pd.DataFrame({
-                        "Feature Name": ["Total"],
-                        "Odds": [total_odds],
-                        "Score": [final_score]
-                    })
-
-                    # Combine rows
-                    display_df = pd.concat(
-                        [baseline_row, display_df, total_row],
-                        ignore_index=True
-                    )
-
-                    # Display
-                    st.dataframe(
-                        display_df.style.format({
-                            "Odds": "{:.2f}",
-                            "Score": "{:+.2f}"
-                        }),     
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-
-                    # pred_obj = Prediction(state, area_code, inter_plan, voice_mail_plan, num_vmail_msg, total_day_min, total_day_calls, total_day_charge,
-                    #             total_eve_charge, total_night_charge, total_int_min, total_int_calls, total_int_charge,
-                    #             number_cust_srv_calls)
-
-                    # data_df = pred_obj.get_data()
-
-                    # transformed_df, pred, _ = pred_obj.get_predictions()
-
-                    # if pred == 1:
-                    #     st.success('Customer will churn')
-                    # elif pred == 0:
-                    #     st.success('Customer will not churn')
+                    st.code(traceback.format_exc())
 
 
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     main()
